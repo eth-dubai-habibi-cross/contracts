@@ -6,12 +6,13 @@ import "@chainlink/contracts-ccip/src/v0.8/shared/access/OwnerIsCreator.sol";
 import "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/LinkTokenInterface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/metatx/ERC2771Context.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@chainlink/contracts/src/v0.8/functions/v1_0_0/FunctionsClient.sol";
 import "@chainlink/contracts/src/v0.8/functions/v1_0_0/libraries/FunctionsRequest.sol";
 
-contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
-  using FunctionsRequest for FunctionsRequest.Request;
+contract RewardManager is OwnerIsCreator, FunctionsClient {
+    using SafeERC20 for IERC20;
+    using FunctionsRequest for FunctionsRequest.Request;
 
   bytes32 public donId; // DON ID for the Functions DON to which the requests are sent
 
@@ -19,6 +20,7 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
   bytes public s_lastResponse;
   bytes public s_lastError;
   event Response(bytes32 indexed requestId, bytes response, bytes err);
+  event USDCAddressUpdated(address indexed newAddress);
 
   error NotEnoughBalance(uint256 currentBalance, uint256 required);
   error NotWhitelisted(address user);
@@ -33,10 +35,14 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
     address feeToken,
     uint256 fees
   );
+
   event RewardAdded(address indexed user, uint256 amount);
   event UserWhitelisted(address indexed user);
   event UserRemovedFromWhitelist(address indexed user);
   event RewardDirectlySent(address indexed user, uint256 amount);
+  event UsdcTransferredToDestination(bytes32 messageId, address receiver, uint256 amount, uint256 ccipFee);
+  event UsdcTransferredToXDC(address indexed user, uint256 amount);
+  event UsdcTransferredToMorph(address indexed user, uint256 amount);
 
   IRouterClient private s_router;
   LinkTokenInterface private s_linkToken;
@@ -52,9 +58,8 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
     address _router,
     address _link,
     address _usdc,
-    address _trustedForwarder,
     bytes32 _donId
-  ) OwnerIsCreator() ERC2771Context(_trustedForwarder) FunctionsClient(_functionsRouter) {
+  ) OwnerIsCreator() FunctionsClient(_functionsRouter) {
     s_router = IRouterClient(_router);
     s_linkToken = LinkTokenInterface(_link);
     usdc = IERC20(_usdc);
@@ -102,6 +107,39 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
     }
   }
 
+function transferUSDCToDestination(uint64 destinationChainSelector, address receiver, uint256 amount) public {
+    require(usdc.balanceOf(address(this)) >= amount, "Not enough USDC balance");
+
+    // Prepare message for CCIP Send
+    Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
+    tokenAmounts[0] = Client.EVMTokenAmount({
+        token: address(usdc),
+        amount: amount
+    });
+
+    Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
+        receiver: abi.encode(receiver),
+        data: "",
+        tokenAmounts: tokenAmounts,
+        extraArgs: Client._argsToBytes(Client.EVMExtraArgsV1({gasLimit: 0})),
+        feeToken: address(s_linkToken)
+    });
+
+    uint256 ccipFee = s_router.getFee(destinationChainSelector, message);
+    if (ccipFee > s_linkToken.balanceOf(address(this))) {
+        revert("Insufficient LINK to cover CCIP fees");
+    }
+
+    s_linkToken.approve(address(s_router), ccipFee);
+    usdc.approve(address(s_router), amount);
+
+    // Send the cross-chain message
+    bytes32 messageId = s_router.ccipSend(destinationChainSelector, message);
+
+    emit UsdcTransferredToDestination(messageId, receiver, amount, ccipFee);
+}
+
+
   // Add or update rewards for a user
   function addReward(address user, uint256 amount) public onlyOwner {
     require(whitelisted[user], "User not whitelisted");
@@ -123,7 +161,7 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
 
   // A new function that allows users to directly claim their rewards on the current chain
   function claimRewardSource() public {
-    address user = _msgSender();
+    address user = msg.sender;
     require(whitelisted[user], "Not whitelisted");
     uint256 amount = rewardBalances[user];
     require(amount > 0, "No rewards available");
@@ -137,20 +175,20 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
 
   // Function for gamers to claim their rewards
   function claimRewards(uint64 destinationChainSelector, address destinationContractAddress) public {
-    require(whitelisted[_msgSender()], "Not whitelisted");
-    uint256 amount = rewardBalances[_msgSender()];
+    require(whitelisted[msg.sender], "Not whitelisted");
+    uint256 amount = rewardBalances[msg.sender];
     require(amount > 0, "No rewards available");
 
     // Deduct the reward balance before sending to prevent re-entrancy attacks
-    rewardBalances[_msgSender()] = 0;
+    rewardBalances[msg.sender] = 0;
 
-    bytes32 messageId = sendReward(destinationChainSelector, destinationContractAddress, _msgSender(), amount);
+    bytes32 messageId = sendReward(destinationChainSelector, destinationContractAddress, msg.sender, amount);
 
     emit RewardSent(
       messageId,
       destinationChainSelector,
       destinationContractAddress,
-      _msgSender(),
+      msg.sender,
       amount,
       address(s_linkToken),
       0
@@ -190,14 +228,41 @@ contract RewardManager is OwnerIsCreator, ERC2771Context, FunctionsClient {
     return messageId;
   }
 
+  
+
+ // Function to update the USDC contract address
+  function updateUSDCAddress(address newUsdcAddress) external onlyOwner {
+    require(newUsdcAddress != address(0), "Invalid address");
+    usdc = IERC20(newUsdcAddress);
+    emit USDCAddressUpdated(newUsdcAddress);
+  }
+
   // Function to check the reward balance of a caller
   function getRewardBalance() public view returns (uint256) {
-    require(whitelisted[_msgSender()], "Not whitelisted");
-    return rewardBalances[_msgSender()];
+    require(whitelisted[msg.sender], "Not whitelisted");
+    return rewardBalances[msg.sender];
   }
 
   // Function to check if a caller is whitelisted
   function isWhitelisted() public view returns (bool) {
-    return whitelisted[_msgSender()];
+    return whitelisted[msg.sender];
   }
+
+        // Function to update user rewards balance and emit event for XDC network
+    function transferToXDC(address user, uint256 amount) public onlyOwner {
+        require(whitelisted[user], "User not whitelisted");
+        require(rewardBalances[user] >= amount, "Insufficient rewards");
+
+        rewardBalances[user] -= amount;
+        emit UsdcTransferredToXDC(user, amount);
+    }
+
+    // Function to update user rewards balance and emit event for Morphius network
+    function transferToMorph(address user, uint256 amount) public onlyOwner {
+        require(whitelisted[user], "User not whitelisted");
+        require(rewardBalances[user] >= amount, "Insufficient rewards");
+
+        rewardBalances[user] -= amount;
+        emit UsdcTransferredToMorph(user, amount);
+    }
 }
