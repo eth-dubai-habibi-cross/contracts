@@ -248,8 +248,8 @@ function transferUSDCToDestination(uint64 destinationChainSelector, address rece
     return whitelisted[msg.sender];
   }
 
-        // Function to update user rewards balance and emit event for XDC network
-    function transferToXDC(address user, uint256 amount) public onlyOwner {
+    // Function to update user rewards balance and emit event for XDC network
+    function transferToXDC(address user, uint256 amount) public  {
         require(whitelisted[user], "User not whitelisted");
         require(rewardBalances[user] >= amount, "Insufficient rewards");
 
@@ -258,7 +258,7 @@ function transferUSDCToDestination(uint64 destinationChainSelector, address rece
     }
 
     // Function to update user rewards balance and emit event for Morphius network
-    function transferToMorph(address user, uint256 amount) public onlyOwner {
+    function transferToMorph(address user, uint256 amount) public  {
         require(whitelisted[user], "User not whitelisted");
         require(rewardBalances[user] >= amount, "Insufficient rewards");
 
